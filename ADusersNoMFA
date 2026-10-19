@@ -1,0 +1,223 @@
+
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    Audita usuarios Member habilitados sin MFA registrado en Entra ID.
+.DESCRIPTION
+    Obtiene el informe de registro MFA, consulta el directorio,
+    cruza los datos por Object ID, valida resultados y exporta CSV.
+.PERMISSIONS
+    Microsoft Graph delegated: AuditLog.Read.All, User.Read.All.
+    La cuenta debe tener un rol de Entra compatible con el informe,
+    por ejemplo Reports Reader, Security Reader o Global Reader.
+#>
+
+$ErrorActionPreference = "Stop"
+
+# ----- Configuración -----
+$OutputPath = Join-Path $PSScriptRoot "Members_Sin_MFA.csv"
+$RequiredScopes = @("AuditLog.Read.All", "User.Read.All")
+
+try {
+    Write-Host "`n=== Auditoria de MFA en Entra ID ===" -ForegroundColor Cyan
+
+    # 1. Validar e importar módulos necesarios
+    $requiredModules = @(
+        "Microsoft.Graph.Authentication",
+        "Microsoft.Graph.Reports",
+        "Microsoft.Graph.Users"
+    )
+
+    foreach ($moduleName in $requiredModules) {
+        if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+            throw "Falta el módulo $moduleName. Instálalo con: Install-Module $moduleName -Scope CurrentUser"
+        }
+        Import-Module $moduleName -ErrorAction Stop
+    }
+
+    # 2. Conectar a Graph si no hay sesión activa con los permisos requeridos
+    $context = Get-MgContext
+    $missingScopes = @()
+
+    if ($context) {
+        $missingScopes = @(
+            $RequiredScopes | Where-Object {
+                $_ -notin $context.Scopes
+            }
+        )
+    }
+
+    if (-not $context -or $missingScopes.Count -gt 0) {
+        Write-Host "Conectando a Microsoft Graph..." -ForegroundColor Yellow
+
+        if ($context) {
+            Disconnect-MgGraph | Out-Null
+        }
+
+        Connect-MgGraph -Scopes $RequiredScopes -NoWelcome
+        $context = Get-MgContext
+    }
+
+    if (-not $context -or -not $context.TenantId) {
+        throw "No se pudo confirmar el contexto de Microsoft Graph."
+    }
+
+    Write-Host "Tenant ID: $($context.TenantId)" -ForegroundColor Gray
+    Write-Host "Cuenta:    $($context.Account)" -ForegroundColor Gray
+
+    # 3. Obtener el informe completo de registro MFA
+    Write-Host "`nConsultando informe de registro MFA..." -ForegroundColor Cyan
+
+    $mfaReport = @(
+        Get-MgReportAuthenticationMethodUserRegistrationDetail -All
+    )
+
+    if ($mfaReport.Count -eq 0) {
+        throw "El informe MFA no devolvió registros. Se cancela la exportación."
+    }
+
+    Write-Host "Registros del informe MFA: $($mfaReport.Count)"
+
+    # 4. Obtener usuarios del directorio
+    Write-Host "Obteniendo usuarios del directorio..." -ForegroundColor Cyan
+
+    $directoryUsers = @(
+        Get-MgUser -All -Property `
+            Id, MailNickname, DisplayName, UserPrincipalName, AccountEnabled, UserType
+    )
+
+    if ($directoryUsers.Count -eq 0) {
+        throw "La consulta del directorio no devolvió usuarios."
+    }
+
+    Write-Host "Usuarios del directorio: $($directoryUsers.Count)"
+
+    # 5. Crear índice de usuarios por Object ID
+    $directoryById = @{}
+
+    foreach ($user in $directoryUsers) {
+        if ($user.Id) {
+            $directoryById[$user.Id] = $user
+        }
+    }
+
+    # 6. Validar IDs del informe y enriquecer los registros
+    $reportIds = @(
+        $mfaReport | Where-Object { $_.Id } |
+            Select-Object -ExpandProperty Id -Unique
+    )
+
+    $missingIds = @(
+        $mfaReport | Where-Object { -not $_.Id }
+    )
+
+    if ($missingIds.Count -gt 0) {
+        throw "$($missingIds.Count) registros del informe no tienen ID. Se cancela la exportación."
+    }
+
+    $duplicateIds = $mfaReport.Count - $reportIds.Count
+
+    $enriched = @(
+        foreach ($record in $mfaReport) {
+            $user = $directoryById[$record.Id]
+
+            [PSCustomObject]@{
+                Id                = $record.Id
+				Username          = if ($user) { $user.MailNickname } else { $null }
+                DisplayName       = if ($user) { $user.DisplayName } else { $record.UserDisplayName }
+                UserPrincipalName = if ($user) { $user.UserPrincipalName } else { $record.UserPrincipalName }
+                UserType          = if ($user) { $user.UserType } else { "No encontrado" }
+                AccountEnabled    = if ($user) { $user.AccountEnabled } else { $null }
+                IsMfaRegistered   = $record.IsMfaRegistered
+                IsMfaCapable      = $record.IsMfaCapable
+                MethodsRegistered = (@($record.MethodsRegistered) -join ", ")
+                DirectoryMatch    = [bool]$user
+            }
+        }
+    )
+
+    $unmatched = @(
+        $enriched | Where-Object { -not $_.DirectoryMatch }
+    )
+
+    Write-Host "`n=== Validacion de datos ===" -ForegroundColor Cyan
+    Write-Host "Registros MFA:           $($mfaReport.Count)"
+    Write-Host "Registros enriquecidos:  $($enriched.Count)"
+    Write-Host "IDs duplicados:          $duplicateIds"
+    Write-Host "Sin coincidencia:        $($unmatched.Count)"
+
+    # No producir un reporte aparentemente completo si falla el cruce
+    if ($unmatched.Count -gt 0) {
+        $unmatchedPath = Join-Path $PSScriptRoot "MFA_Sin_Coincidencia.csv"
+
+        $unmatched |
+            Select-Object Id, DisplayName, UserPrincipalName,
+                          UserType, AccountEnabled, IsMfaRegistered |
+            Export-Csv -Path $unmatchedPath -NoTypeInformation -Encoding UTF8
+
+        throw "Hay registros que no coinciden con el directorio. Revisa $unmatchedPath"
+    }
+
+    if ($duplicateIds -gt 0) {
+        throw "El informe contiene IDs duplicados. Se cancela la exportación para revisar los datos."
+    }
+
+    # 7. Seleccionar miembros habilitados sin MFA registrado
+    $priorityUsers = @(
+        $enriched | Where-Object {
+            $_.UserType -eq "Member" -and
+            $_.AccountEnabled -eq $true -and
+            $_.IsMfaRegistered -eq $false
+        }
+    )
+
+    # 8. Exportar CSV
+    $csvRows = @(
+        $priorityUsers | Select-Object `
+			Username,
+            DisplayName,
+            UserPrincipalName,
+            Id,
+            AccountEnabled,
+            IsMfaRegistered,
+            IsMfaCapable,
+            MethodsRegistered
+    )
+
+    if ($csvRows.Count -eq 0) {
+        Write-Warning "No se encontraron miembros habilitados sin MFA registrado."
+        Write-Warning "Se generará un CSV con encabezados, pero valida el resultado antes de concluir que no existen cuentas."
+    }
+
+    $csvRows | Export-Csv -Path $OutputPath `
+        -NoTypeInformation -Encoding UTF8
+
+    # 9. Validar el archivo generado
+    if (-not (Test-Path $OutputPath)) {
+        throw "No se encontró el CSV después de la exportación."
+    }
+
+    $importedRows = @(Import-Csv -Path $OutputPath)
+
+    if ($importedRows.Count -ne $priorityUsers.Count) {
+        throw "La validación del CSV no coincide con el número de registros seleccionados."
+    }
+
+    Write-Host "`n=== Resultado ===" -ForegroundColor Green
+    Write-Host "Usuarios Member habilitados sin MFA: $($priorityUsers.Count)"
+    Write-Host "Filas verificadas en CSV:            $($importedRows.Count)"
+    Write-Host "Archivo: $OutputPath" -ForegroundColor Green
+
+    # Resumen de todos los registros clasificados
+    Write-Host "`nResumen de usuarios por tipo, estado y MFA:" -ForegroundColor Cyan
+
+    $enriched |
+        Group-Object UserType, AccountEnabled, IsMfaRegistered |
+        Select-Object Name, Count |
+        Sort-Object Name |
+        Format-Table -AutoSize
+}
+catch {
+    Write-Host "`nERROR: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
